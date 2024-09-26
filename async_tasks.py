@@ -17,8 +17,9 @@ load_dotenv()
 init(autoreset=True)
 
 ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
-VOICE_ID = os.getenv('ELEVENLABS_VOICE_ID', '2zx61Bg0KUjMrtgwGujs')
-MODEL_ID = 'eleven_turbo_v2'
+VOICE_ID = os.getenv('ELEVENLABS_VOICE_ID', '94zOad0g7T7K4oa7zhDq')  # Changed to a default voice ID
+#MODEL_ID = 'eleven_turbo_v2'
+MODEL_ID = 'eleven_multilingual_v2'
 
 file_increment = 0
 audio_queue = deque()
@@ -30,6 +31,24 @@ shutdown_event = asyncio.Event()
 
 directory = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 os.makedirs(f'output/{directory}', exist_ok=True)
+
+
+async def get_available_voices():
+    url = 'https://api.elevenlabs.io/v1/voices'
+    headers = {
+        "Accept": "application/json",
+        "xi-api-key": ELEVENLABS_API_KEY
+    }
+
+    async with AsyncClient() as client:
+        response = await client.get(url, headers=headers)
+        if response.status_code == 200:
+            voices = response.json()['voices']
+            print("Available voices:")
+            for voice in voices:
+                print(f"ID: {voice['voice_id']}, Name: {voice['name']}")
+        else:
+            print(f"Error getting voices: {response.status_code} - {response.text}")
 
 
 async def process_text_to_speech(text):
@@ -52,25 +71,28 @@ async def process_text_to_speech(text):
     data = {
         "model_id": MODEL_ID,
         "text": text,
-        "voice_settings": {"similarity_boost": 0.8, "stability": 0.35}
+        "voice_settings": {"similarity_boost": 0.8, "stability": 0.5, "style": 0.0, "use_speaker_boost": True}
     }
 
     timeout = Timeout(30.0, connect=60.0)
 
     # print(Fore.YELLOW + f"Calling elevenlabs increment: {file_increment}" + Style.RESET_ALL)
 
-    async with AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, json=data, headers=headers)
+    try:
+        async with AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, json=data, headers=headers)
 
-        if response.status_code == 200:
-            # print(Fore.GREEN + "200 from elevenlabs" + Style.RESET_ALL)
-            with open(filename, 'wb') as audio_file:
-                audio_file.write(response.content)
-            audio_queue.append(filename)
-        else:
-            print(
-                f"Error generating speech: {response.status_code} - {response.text}")
-
+            if response.status_code == 200:
+                with open(filename, 'wb') as audio_file:
+                    audio_file.write(response.content)
+                audio_queue.append(filename)
+            else:
+                print(f"Error generating speech: {response.status_code} - {response.text}")
+                if response.status_code == 400 and "voice_not_found" in response.text:
+                    print("The specified voice ID was not found. Here are the available voices:")
+                    await get_available_voices()
+    except Exception as e:
+        print(f"An error occurred while generating speech: {str(e)}")
 
 async def play_audio():
     while True:
