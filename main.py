@@ -4,7 +4,6 @@ import os
 import asyncio
 import keyboard
 import platform
-import GPUtil
 import time
 import tempfile
 import anthropic
@@ -18,9 +17,11 @@ from scipy.io.wavfile import write
 from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 from colorama import init, Fore, Style
+import subprocess
 # Redirect stdout to devnull while importing Pygame
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
+from async_tasks import get_available_voices
 # fmt: on
 
 
@@ -39,11 +40,87 @@ pygame.init()
 conversation_history = []
 shutdown_event = asyncio.Event()
 model_size = "small"
-supports_gpu = len(GPUtil.getAvailable()) > 0
-compute_type = "float16" if supports_gpu else "float32"
+def get_cuda_version():
+    try:
+        output = subprocess.check_output(['nvcc', '--version']).decode('utf-8')
+        version = re.search(r'release (\S+),', output)
+        return version.group(1) if version else "Not found"
+    except:
+        return "Not found"
+
+def get_cudnn_version():
+    try:
+        import ctypes
+        libcudnn_path = '/usr/local/cuda/targets/x86_64-linux/lib/libcudnn.so'
+        if not os.path.exists(libcudnn_path):
+            print(f"cuDNN library not found at {libcudnn_path}")
+            return "Not found"
+        libcudnn = ctypes.CDLL(libcudnn_path)
+        version = ctypes.c_int()
+        libcudnn.cudnnGetVersion.restype = ctypes.c_int
+        libcudnn.cudnnGetVersion(ctypes.byref(version))
+        return f"{version.value // 1000}.{(version.value % 1000) // 100}.{version.value % 100}"
+    except Exception as e:
+        print(f"Error getting cuDNN version: {e}")
+        return "Not found"
+
+def detect_cuda():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True, torch.cuda.get_device_name(0)
+        else:
+            return False, "CUDA is available but no compatible GPU found"
+    except ImportError:
+        return False, "PyTorch not installed"
+
+
+def print_system_info():
+    cuda_available, cuda_info = detect_cuda()
+    cuda_version = get_cuda_version()
+    cudnn_version = get_cudnn_version()
+
+    print(Fore.CYAN + "System Information:")
+    print(f"CUDA Available: {cuda_available}")
+    print(f"CUDA Info: {cuda_info}")
+    print(f"CUDA Version: {cuda_version}")
+    print(f"cuDNN Version: {cudnn_version}")
+    print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not set')}")
+    print(f"CUDA_HOME: {os.environ.get('CUDA_HOME', 'Not set')}")
+
+    # Check for specific cuDNN libraries
+    cudnn_libs = [
+        'libcudnn.so',
+        'libcudnn_ops_infer.so.8',
+        'libcudnn_ops_train.so.8',
+        'libcudnn_cnn_infer.so.8',
+        'libcudnn_cnn_train.so.8',
+        'libcudnn_adv_infer.so.8',
+        'libcudnn_adv_train.so.8'
+    ]
+
+    for lib in cudnn_libs:
+        path = f"/usr/local/cuda/targets/x86_64-linux/lib/{lib}"
+        if os.path.exists(path):
+            print(f"{lib} found at {path}")
+        else:
+            print(f"{lib} not found")
+
+print_system_info()
+
+supports_cuda, cuda_info = detect_cuda()
+if supports_cuda:
+    compute_type = "float16"
+    device = "cuda"
+    print(Fore.GREEN + "CUDA is available and will be used for transcription.")
+else:
+    compute_type = "int8"
+    device = "cpu"
+    print(Fore.YELLOW + "CUDA is not available. Using CPU for transcription.")
+
 recording_finished = False
 is_recording = False
-command_key = "the space bar" if platform == 'win32' else "<enter>"
+command_key = "<enter>"
 
 class States:
     WAITING_FOR_USER = 1
@@ -102,20 +179,41 @@ def on_space_press(event):
 
 
 def transcribe_audio_to_text(audio_data, sample_rate):
-    # print("Transcribing audio...")
+    global supports_cuda, compute_type, device
     temp_dir = './input/'
     os.makedirs(temp_dir, exist_ok=True)
     temp_file_path = tempfile.mktemp(suffix='.wav', dir=temp_dir)
     try:
         write(temp_file_path, sample_rate, audio_data)
-        # print(f"Audio written to temporary file: {temp_file_path}")
-        segments, _ = WhisperModel(
-            model_size, device=f"{'cuda' if supports_gpu else 'cpu'}", compute_type=compute_type).transcribe(temp_file_path)
+
+        # Use the detected device and compute_type
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+        segments, _ = model.transcribe(temp_file_path)
         transcript = " ".join(segment.text for segment in segments)
         print(Fore.GREEN + "User:", transcript)
         return transcript
     except Exception as e:
-        print(Fore.RED + "Error during transcription:", e)
+        print(Fore.RED + f"Error during transcription: {e}")
+        print(Fore.YELLOW + "Detailed error information:")
+        import traceback
+        traceback.print_exc()
+        if supports_cuda:
+            print(Fore.YELLOW + "CUDA error encountered. Falling back to CPU.")
+            supports_cuda = False
+            compute_type = "int8"
+            device = "cpu"
+            # Retry transcription with CPU
+            try:
+                model = WhisperModel(model_size, device="cpu", compute_type="int8")
+                segments, _ = model.transcribe(temp_file_path)
+                transcript = " ".join(segment.text for segment in segments)
+                print(Fore.GREEN + "User:", transcript)
+                return transcript
+            except Exception as e:
+                print(Fore.RED + f"Error during CPU transcription: {e}")
+                traceback.print_exc()
+        return "Error in transcription"
     finally:
         os.remove(temp_file_path)
 
@@ -196,9 +294,12 @@ def run_async_tasks():
     finally:
         loop.close()
 
-
-def main():
+async def main():
     global current_state, is_recording
+
+    # Check available ElevenLabs voices
+    await get_available_voices()
+
     thread = Thread(target=run_async_tasks)
     thread.start()
 
@@ -219,7 +320,6 @@ def main():
             set_keyboard_handler(on_space_press)
         while True:
             if current_state != previous_state:
-                # print(f"Current state: {current_state}")
                 previous_state = current_state  # Update previous_state
 
             if current_state == States.RECORDING_USER_INPUT:
@@ -228,19 +328,17 @@ def main():
                 current_state = States.PROCESSING_USER_INPUT
 
             elif current_state == States.PROCESSING_USER_INPUT:
-                # print("Processing user input...")
                 # Transcribe and process input
                 user_input = transcribe_audio_to_text(recording, fs)
                 generate_and_process_text(user_input, transcription_file)
                 current_state = States.GENERATING_RESPONSE
 
             elif current_state == States.GENERATING_RESPONSE:
-                # print("Generating response...")
                 if not pygame.mixer.music.get_busy():  # Check if pygame playback is completed
                     current_state = States.WAITING_FOR_USER
 
             # Add a short sleep to prevent the loop from hogging CPU
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
     except KeyboardInterrupt:
         print(Fore.RED + "\nShutting down gracefully...")
@@ -249,4 +347,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
