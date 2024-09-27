@@ -1,32 +1,34 @@
 # fmt: off
+from summaries import session_one_summary, session_two_summary, session_two_part_two_summary
 import os
-import sys
 import asyncio
 import keyboard
+import platform
 import time
 import tempfile
 import anthropic
 import datetime
 import sounddevice as sd
 import numpy as np
-from async_tasks import start_async_tasks, text_to_speech_queue
+import re
+from async_tasks import start_async_tasks, text_to_speech_queue, stop_async_tasks, set_keyboard_handler
 from threading import Thread
 from scipy.io.wavfile import write
 from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 from colorama import init, Fore, Style
+import subprocess
 # Redirect stdout to devnull while importing Pygame
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
+from async_tasks import get_available_voices
 # fmt: on
 
 
-# Credentials and API keys
+# Initialization
 load_dotenv()
-anthropic_key = os.getenv('ANTHROPIC_KEY')
-
-# Initialize colorama and Anthropic client
 init(autoreset=True)
+anthropic_key = os.getenv('ANTHROPIC_KEY')
 client = anthropic.Anthropic(api_key=anthropic_key)
 
 # Initialize Pygame for audio playback
@@ -37,11 +39,88 @@ pygame.init()
 # Global variables
 conversation_history = []
 shutdown_event = asyncio.Event()
-model_size = "tiny"
-compute_type = "float16"
+model_size = "small"
+def get_cuda_version():
+    try:
+        output = subprocess.check_output(['nvcc', '--version']).decode('utf-8')
+        version = re.search(r'release (\S+),', output)
+        return version.group(1) if version else "Not found"
+    except:
+        return "Not found"
+
+def get_cudnn_version():
+    try:
+        import ctypes
+        libcudnn_path = '/usr/local/cuda/targets/x86_64-linux/lib/libcudnn.so'
+        if not os.path.exists(libcudnn_path):
+            print(f"cuDNN library not found at {libcudnn_path}")
+            return "Not found"
+        libcudnn = ctypes.CDLL(libcudnn_path)
+        version = ctypes.c_int()
+        libcudnn.cudnnGetVersion.restype = ctypes.c_int
+        libcudnn.cudnnGetVersion(ctypes.byref(version))
+        return f"{version.value // 1000}.{(version.value % 1000) // 100}.{version.value % 100}"
+    except Exception as e:
+        print(f"Error getting cuDNN version: {e}")
+        return "Not found"
+
+def detect_cuda():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True, torch.cuda.get_device_name(0)
+        else:
+            return False, "CUDA is available but no compatible GPU found"
+    except ImportError:
+        return False, "PyTorch not installed"
+
+
+def print_system_info():
+    cuda_available, cuda_info = detect_cuda()
+    cuda_version = get_cuda_version()
+    cudnn_version = get_cudnn_version()
+
+    print(Fore.CYAN + "System Information:")
+    print(f"CUDA Available: {cuda_available}")
+    print(f"CUDA Info: {cuda_info}")
+    print(f"CUDA Version: {cuda_version}")
+    print(f"cuDNN Version: {cudnn_version}")
+    print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'Not set')}")
+    print(f"CUDA_HOME: {os.environ.get('CUDA_HOME', 'Not set')}")
+
+    # Check for specific cuDNN libraries
+    cudnn_libs = [
+        'libcudnn.so',
+        'libcudnn_ops_infer.so.8',
+        'libcudnn_ops_train.so.8',
+        'libcudnn_cnn_infer.so.8',
+        'libcudnn_cnn_train.so.8',
+        'libcudnn_adv_infer.so.8',
+        'libcudnn_adv_train.so.8'
+    ]
+
+    for lib in cudnn_libs:
+        path = f"/usr/local/cuda/targets/x86_64-linux/lib/{lib}"
+        if os.path.exists(path):
+            print(f"{lib} found at {path}")
+        else:
+            print(f"{lib} not found")
+
+print_system_info()
+
+supports_cuda, cuda_info = detect_cuda()
+if supports_cuda:
+    compute_type = "float16"
+    device = "cuda"
+    print(Fore.GREEN + "CUDA is available and will be used for transcription.")
+else:
+    compute_type = "int8"
+    device = "cpu"
+    print(Fore.YELLOW + "CUDA is not available. Using CPU for transcription.")
+
 recording_finished = False
 is_recording = False
-
+command_key = "<enter>"
 
 class States:
     WAITING_FOR_USER = 1
@@ -53,26 +132,19 @@ class States:
 
 current_state = States.WAITING_FOR_USER
 
-system_message = '''Claude, your responses in this conversation will be converted to speech in real-time for a voice-based interaction. Please optimize your replies for this format:
-Be concise and focus on the most salient points. Aim for brevity over lengthy explanations.
-Jump straight into your key ideas without summarizing or affirming the human's stance each time.
-Make your points directly. Turn the conversation back to the human quickly. You don't need to re-state or summarize what you've already said. Think of this as me interviewing you, you do not need to wrap up your comments with open ended questions.
-
-Feel free to be unexpected, witty, irreverent, and humorous when appropriate. Don't be afraid to make keen observations, ask thought-provoking questions, or leave some ideas incomplete for us to ponder. The goal is an engaging, unpredictable, interesting dialogue.
-If a great insight, joke, or question comes to mind that doesn't fit the current topic, go ahead and say it anyway. We can always circle back to the main thread later. Serendipity and tangents are welcome.
-The overall goal is to have a lively, natural conversation with plenty of back-and-forth. Prioritize concision, but also allow room for humor, improvisation, and provocative ideas. Efficiency is good, but so is keeping things fun and stimulating. We would prefer to cover a topic with many brief back and forth comments rather than a few long monologues. Do not emote using asterisks in your replies. Communicate in a natural spoken style.'''
+system_message = f'We will continue our conversation. Here is a summary of the first part of our discussion: {session_one_summary} and the second part of our discussion {session_two_summary}...{session_two_part_two_summary}. Please be brief in your replies and focus on the most interesting concepts.'
 
 print("\nClaude's instructions: " + system_message + Fore.YELLOW +
-      "\n\nPress spacebar to capture your audio and begin the conversation." + Style.RESET_ALL)
+      f"\n\nPress {command_key} to capture your audio and begin the conversation." + Style.RESET_ALL)
 
 
 def record_audio():
     global is_recording
-    fs = 16000  # Sample rate
+    fs = 44100  # Sample rate
     duration = 90  # Maximum possible duration, but we can stop earlier
     block_duration = 0.1  # Duration of each audio block in seconds
 
-    # Callback function to be called for each audio block. Frames, time, and status are used by library mechanisms outside this script so need to stay.
+    # Callback function to be called for each audio block
     def callback(indata, frames, time, status):
         nonlocal audio_data
         if is_recording:
@@ -83,7 +155,7 @@ def record_audio():
 
     audio_data = []
     # Start recording in a non-blocking manner
-    with sd.InputStream(callback=callback, samplerate=fs, channels=1, blocksize=int(fs * block_duration)):
+    with sd.InputStream(callback=callback, samplerate=fs, channels=2, blocksize=int(fs * block_duration)):
         while is_recording and len(audio_data) * block_duration < duration:
             sd.sleep(int(block_duration * 1000))
 
@@ -99,7 +171,7 @@ def on_space_press(event):
         if current_state == States.WAITING_FOR_USER:
             is_recording = True
             current_state = States.RECORDING_USER_INPUT
-            print(Fore.YELLOW + "Recording started. Press the space bar to stop.")
+            print(Fore.YELLOW + f"Recording started. Press {command_key} to stop.")
         elif current_state == States.RECORDING_USER_INPUT and is_recording:
             is_recording = False  # This will trigger the recording to stop
             print("Recording stopped. Processing input...")
@@ -107,33 +179,52 @@ def on_space_press(event):
 
 
 def transcribe_audio_to_text(audio_data, sample_rate):
-    start_time = time.time()  # Record the start time
+    global supports_cuda, compute_type, device
     temp_dir = './input/'
     os.makedirs(temp_dir, exist_ok=True)
     temp_file_path = tempfile.mktemp(suffix='.wav', dir=temp_dir)
     try:
         write(temp_file_path, sample_rate, audio_data)
-        segments, _ = WhisperModel(
-            model_size, device="cuda", compute_type=compute_type).transcribe(temp_file_path)
+
+        # Use the detected device and compute_type
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+        segments, _ = model.transcribe(temp_file_path)
         transcript = " ".join(segment.text for segment in segments)
         print(Fore.GREEN + "User:", transcript)
-        end_time = time.time()  # Record the end time
-        duration = end_time - start_time  # Calculate the duration
-        print(f"[Transcription: {duration:.2f} seconds]")
         return transcript
     except Exception as e:
-        print(Fore.RED + "Error during transcription:", e)
+        print(Fore.RED + f"Error during transcription: {e}")
+        print(Fore.YELLOW + "Detailed error information:")
+        import traceback
+        traceback.print_exc()
+        if supports_cuda:
+            print(Fore.YELLOW + "CUDA error encountered. Falling back to CPU.")
+            supports_cuda = False
+            compute_type = "int8"
+            device = "cpu"
+            # Retry transcription with CPU
+            try:
+                model = WhisperModel(model_size, device="cpu", compute_type="int8")
+                segments, _ = model.transcribe(temp_file_path)
+                transcript = " ".join(segment.text for segment in segments)
+                print(Fore.GREEN + "User:", transcript)
+                return transcript
+            except Exception as e:
+                print(Fore.RED + f"Error during CPU transcription: {e}")
+                traceback.print_exc()
+        return "Error in transcription"
     finally:
         os.remove(temp_file_path)
 
 
-def generate_and_process_text(user_input, transcript_file):
+def generate_and_process_text(user_input, transcription_file):
     # Trim whitespace and check if input is empty
     user_input = user_input.strip()
     if user_input:  # Proceed only if user_input is not empty
         conversation_history.append({"role": "user", "content": user_input})
-        with open(transcript_file, "a") as file:
-            file.write(f"~~~\n\nUser: {user_input}\n\n~~~\n")
+        with open(transcription_file, "a") as file:
+            file.write(f"User: {user_input}\n")
     else:
         print(Fore.RED + "Received empty input, skipping...")
         return  # Skip processing for empty input
@@ -147,30 +238,26 @@ def generate_and_process_text(user_input, transcript_file):
     validated_history = [
         msg for msg in conversation_history if msg.get("content").strip()]
 
-    try:
-        with client.messages.stream(
-            max_tokens=1024,
-            messages=validated_history,
-            system=system_message,
-            model="claude-3-opus-20240229",
-        ) as stream:
-            for text in stream.text_stream:
-                print(Fore.CYAN + text + Style.RESET_ALL, end="", flush=True)
-                claude_response += text
-                buffer += text
+    with client.messages.stream(
+        max_tokens=1024,
+        messages=validated_history,
+        system=system_message,
+        model="claude-3-opus-20240229",
+    ) as stream:
+        for text in stream.text_stream:
+            print(Fore.CYAN + text + Style.RESET_ALL, end="", flush=True)
+            claude_response += text
+            buffer += text
 
-                # Check if buffer is ready to be chunked
-                last_splitter_pos = max(buffer.rfind(splitter)
-                                        for splitter in splitters)
-                if len(buffer) >= min_chunk_size and last_splitter_pos != -1:
-                    chunk = buffer[:last_splitter_pos+1]
-                    buffer = buffer[last_splitter_pos+1:]
+            # Check if buffer is ready to be chunked
+            last_splitter_pos = max(buffer.rfind(splitter)
+                                    for splitter in splitters)
+            if len(buffer) >= min_chunk_size and last_splitter_pos != -1:
+                chunk = buffer[:last_splitter_pos+1]
+                buffer = buffer[last_splitter_pos+1:]
 
-                    # Queue this chunk for async TTS processing
-                    queue_chunk_for_processing(chunk)
-    except anthropic.APIError as e:
-        print(Fore.RED + f"Anthropic API Error: {e}")
-        return
+                # Queue this chunk for async TTS processing
+                queue_chunk_for_processing(chunk)
 
     # Process any remaining text in buffer
     if buffer:
@@ -180,14 +267,16 @@ def generate_and_process_text(user_input, transcript_file):
     conversation_history.append(
         {"role": "assistant", "content": claude_response})
 
-    # Write Claude's completed response to the transcript file
-    with open(transcript_file, "a") as file:
-        file.write(f"\nClaude: {claude_response}\n\n")
+    # Write Claude's completed response to the transcription file
+    with open(transcription_file, "a") as file:
+        file.write(f"Claude: {claude_response}\n")
 
     print()  # Newline for separation
 
 
 def queue_chunk_for_processing(chunk):
+    # Remove text within asterisks using regular expression
+    chunk = re.sub(r'\*.*?\*', '', chunk)
     # Queue the chunk for asynchronous processing
     text_to_speech_queue.put_nowait(chunk)
 
@@ -205,96 +294,30 @@ def run_async_tasks():
     finally:
         loop.close()
 
+async def main():
+    global current_state, is_recording
 
-def parse_transcript(transcript_content):
-    conversation_history = []
-    last_role = None  # Variable to keep track of the last role added to the history
-
-    lines = transcript_content.strip().split("\n")
-    for line in lines:
-        if line.startswith("User: "):
-            user_input = line[6:]
-            # Check if the last message is also from the user
-            if last_role == "user":
-                # Append a filler message from the assistant if two user messages are in a row
-                conversation_history.append(
-                    {"role": "assistant", "content": "Please continue..."})
-            conversation_history.append(
-                {"role": "user", "content": user_input})
-            last_role = "user"  # Update the last role
-        elif line.startswith("Claude: "):
-            claude_response = line[8:]
-            conversation_history.append(
-                {"role": "assistant", "content": claude_response})
-            last_role = "assistant"  # Update the last role
-
-    # Check if the last message is from the user
-    if conversation_history and conversation_history[-1]["role"] == "user":
-        # Append a filler message from Claude
-        conversation_history.append({"role": "assistant", "content": "..."})
-
-    return conversation_history
-
-
-def determine_current_state(conversation_history):
-    if conversation_history[-1]["role"] == "assistant":
-        return States.WAITING_FOR_USER
-    else:
-        return States.GENERATING_RESPONSE
-
-
-def setup_new_transcript_file():
-    transcripts_directory = "transcripts"
-    os.makedirs(transcripts_directory, exist_ok=True)
-
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    transcript_file = f"{transcripts_directory}/transcript_{timestamp}.txt"
-    with open(transcript_file, "w") as file:
-        file.write(f"Transcription started at {timestamp}\n\n")
-
-    return transcript_file
-
-
-def setup_transcript_file(transcript_filename):
-    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    new_transcript_file = f"transcripts/transcript_{timestamp}.txt"
-
-    # Copy the content of the original transcript into the new file
-    with open(transcript_filename, "r") as original_file, open(new_transcript_file, "w") as new_file:
-        original_content = original_file.read()
-        new_file.write(original_content)
-        new_file.write(f"\nTranscription resumed at {timestamp}\n\n")
-
-    return new_transcript_file
-
-
-def main():
-    global current_state, is_recording, conversation_history
-
-    if len(sys.argv) == 2:
-        transcript_filename = sys.argv[1]
-        try:
-            with open(transcript_filename, "r") as file:
-                transcript_content = file.read()
-            conversation_history = parse_transcript(transcript_content)
-            current_state = determine_current_state(conversation_history)
-            transcript_file = setup_transcript_file(transcript_filename)
-            print(Fore.GREEN +
-                  f"Resuming conversation from {transcript_filename}")
-        except FileNotFoundError:
-            print(
-                Fore.RED + f"Transcript file '{transcript_filename}' not found. Starting a new conversation.")
-            transcript_file = setup_new_transcript_file()
-    else:
-        transcript_file = setup_new_transcript_file()
+    # Check available ElevenLabs voices
+    await get_available_voices()
 
     thread = Thread(target=run_async_tasks)
     thread.start()
 
     previous_state = None
 
+    transcripts_directory = "transcripts"
+    os.makedirs(transcripts_directory, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    transcription_file = f"{transcripts_directory}/transcription_{timestamp}.txt"
+    with open(transcription_file, "w") as file:
+        file.write(f"Transcription started at {timestamp}\n\n")
+
     try:
-        keyboard.on_press(on_space_press)
+        if platform == "win32":
+            keyboard.on_press(on_space_press)
+        else:
+            set_keyboard_handler(on_space_press)
         while True:
             if current_state != previous_state:
                 previous_state = current_state  # Update previous_state
@@ -307,7 +330,7 @@ def main():
             elif current_state == States.PROCESSING_USER_INPUT:
                 # Transcribe and process input
                 user_input = transcribe_audio_to_text(recording, fs)
-                generate_and_process_text(user_input, transcript_file)
+                generate_and_process_text(user_input, transcription_file)
                 current_state = States.GENERATING_RESPONSE
 
             elif current_state == States.GENERATING_RESPONSE:
@@ -315,7 +338,7 @@ def main():
                     current_state = States.WAITING_FOR_USER
 
             # Add a short sleep to prevent the loop from hogging CPU
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
 
     except KeyboardInterrupt:
         print(Fore.RED + "\nShutting down gracefully...")
@@ -324,4 +347,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
